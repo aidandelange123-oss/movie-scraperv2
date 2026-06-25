@@ -38,8 +38,23 @@ function bootWasm() {
   return bootPromise;
 }
 
-// ── Stream URL resolver ───────────────────────────────────────────────────────
-async function getStream(id, season, episode) {
+// ── Link cache (survives warm invocations) ────────────────────────────────────
+const CACHE_TTL = 30 * 60 * 1000; // 30 minutes
+const linkCache = new Map();      // key -> { url, ts }
+
+function cacheKey(id, season, episode) {
+  return season ? `tv:${id}:${season}:${episode || 1}` : `movie:${id}`;
+}
+
+function parseKey(key) {
+  const parts = String(key).split(':');
+  return parts[0] === 'tv'
+    ? { id: parts[1], season: parts[2], episode: parts[3] }
+    : { id: parts[1] };
+}
+
+// ── Raw stream resolver (always hits vidlink) ─────────────────────────────────
+async function resolveStream(id, season, episode) {
   await bootWasm();
   const token = globalThis.getAdv(String(id));
   if (!token) throw new Error('getAdv returned null');
@@ -58,6 +73,26 @@ async function getStream(id, season, episode) {
   return playlist;
 }
 
+// ── Cached stream resolver ────────────────────────────────────────────────────
+// force: bypass cache and re-resolve (used to repair broken links)
+async function getStream(id, season, episode, { force = false } = {}) {
+  const key = cacheKey(id, season, episode);
+  const cached = linkCache.get(key);
+  if (!force && cached && Date.now() - cached.ts < CACHE_TTL) {
+    return { url: cached.url, key, cached: true };
+  }
+  const url = await resolveStream(id, season, episode);
+  linkCache.set(key, { url, ts: Date.now() });
+  return { url, key, cached: false };
+}
+
+// Re-resolve a fresh playlist URL for a cached stream key (auto-repair).
+async function repairByKey(key) {
+  const { id, season, episode } = parseKey(key);
+  const { url } = await getStream(id, season, episode, { force: true });
+  return url;
+}
+
 // ── HLS upstream fetcher with redirect support ────────────────────────────────
 function fetchUpstream(url, redirects = 0) {
   return new Promise((resolve, reject) => {
@@ -74,15 +109,16 @@ function fetchUpstream(url, redirects = 0) {
   });
 }
 
-function rewriteM3u8(body, url) {
+function rewriteM3u8(body, url, key) {
   const base = url.split('?')[0];
   const baseDir = base.substring(0, base.lastIndexOf('/') + 1);
   const origin = new URL(url).origin;
+  const keyParam = key ? '&k=' + encodeURIComponent(key) : '';
   return body.split('\n').map(line => {
     const t = line.trim();
     if (!t || t.startsWith('#')) return line;
     const abs = t.startsWith('http') ? t : t.startsWith('/') ? origin + t : baseDir + t;
-    return '/api?url=' + encodeURIComponent(abs);
+    return '/api?url=' + encodeURIComponent(abs) + keyParam;
   }).join('\n');
 }
 
@@ -93,11 +129,25 @@ module.exports = async function handler(req, res) {
   const { searchParams } = new URL(req.url, 'http://localhost');
   const q = Object.fromEntries(searchParams);
 
-  // Proxy mode: /api?url=...
+  // Proxy mode: /api?url=...   (optional &k=<streamKey> enables auto-repair)
   if (q.url) {
-    const url = decodeURIComponent(q.url);
+    let url = decodeURIComponent(q.url);
+    const key = q.k ? decodeURIComponent(q.k) : null;
+
+    // Treat the top-level playlist as the "link" worth repairing.
+    const isPlaylistUrl = /\.m3u8?(\?|$)/i.test(url.split('?')[0]);
+
     try {
-      const upstream = await fetchUpstream(url);
+      let upstream = await fetchUpstream(url);
+
+      // Broken link → re-resolve a fresh playlist and retry once.
+      if (upstream.statusCode >= 400 && key && isPlaylistUrl) {
+        try {
+          url = await repairByKey(key);
+          upstream = await fetchUpstream(url);
+        } catch (_) { /* fall through with original response */ }
+      }
+
       const ct = (upstream.headers['content-type'] || '').toLowerCase();
       const isM3u8 = ct.includes('mpegurl') || ct.includes('m3u8') || /\.m3u8?(\?|$)/i.test(url.split('?')[0]);
 
@@ -106,7 +156,7 @@ module.exports = async function handler(req, res) {
         for await (const chunk of upstream) chunks.push(chunk);
         const body = Buffer.concat(chunks).toString('utf8');
         res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
-        return res.end(rewriteM3u8(body, url));
+        return res.end(rewriteM3u8(body, url, key));
       } else {
         res.setHeader('Content-Type', ct || 'application/octet-stream');
         if (upstream.headers['content-length']) res.setHeader('Content-Length', upstream.headers['content-length']);
@@ -114,6 +164,18 @@ module.exports = async function handler(req, res) {
         upstream.pipe(res);
       }
     } catch (err) {
+      // Connection-level failure → attempt repair before giving up.
+      if (key && isPlaylistUrl) {
+        try {
+          url = await repairByKey(key);
+          const upstream = await fetchUpstream(url);
+          const chunks = [];
+          for await (const chunk of upstream) chunks.push(chunk);
+          const body = Buffer.concat(chunks).toString('utf8');
+          res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+          return res.end(rewriteM3u8(body, url, key));
+        } catch (_) { /* fall through to error */ }
+      }
       res.statusCode = 502;
       res.end(err.message);
     }
@@ -129,8 +191,13 @@ module.exports = async function handler(req, res) {
 
   res.setHeader('Content-Type', 'application/json');
   try {
-    const url = await getStream(q.id, q.s, q.e);
-    res.end(JSON.stringify({ url }));
+    // force=1 lets a client explicitly refresh/repair a cached link.
+    const force = q.force === '1' || q.refresh === '1';
+    const { url, key, cached } = await getStream(q.id, q.s, q.e, { force });
+    // Route playback through the proxy with the stream key so broken
+    // links are detected and re-resolved automatically.
+    const proxied = '/api?url=' + encodeURIComponent(url) + '&k=' + encodeURIComponent(key);
+    res.end(JSON.stringify({ url: proxied, direct: url, key, cached }));
   } catch (err) {
     res.statusCode = 500;
     res.end(JSON.stringify({ error: err.message }));

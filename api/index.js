@@ -5,6 +5,8 @@ const path = require('path');
 const https = require('https');
 const http = require('http');
 
+const cache = require('./cache');
+
 const REFERER = 'https://vidlink.pro/';
 const ORIGIN  = 'https://vidlink.pro';
 const UA      = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124';
@@ -38,7 +40,7 @@ function bootWasm() {
   return bootPromise;
 }
 
-// ── Link cache (survives warm invocations) ────────────────────────────────────
+// ── Link cache: fast in-memory layer in front of the shared Redis CDN ─────────
 const CACHE_TTL = 30 * 60 * 1000; // 30 minutes
 const linkCache = new Map();      // key -> { url, ts }
 
@@ -74,20 +76,35 @@ async function resolveStream(id, season, episode) {
 }
 
 // ── Cached stream resolver ────────────────────────────────────────────────────
-// force: bypass cache and re-resolve (used to repair broken links)
+// Two-tier cache: in-memory (warm instance) → Redis (shared across all
+// servers/instances = our CDN) → upstream vidlink resolve.
+// force: bypass both caches and re-resolve (used to repair broken links).
 async function getStream(id, season, episode, { force = false } = {}) {
   const key = cacheKey(id, season, episode);
-  const cached = linkCache.get(key);
-  if (!force && cached && Date.now() - cached.ts < CACHE_TTL) {
-    return { url: cached.url, key, cached: true };
+
+  if (!force) {
+    const mem = linkCache.get(key);
+    if (mem && Date.now() - mem.ts < CACHE_TTL) {
+      return { url: mem.url, key, cached: 'memory' };
+    }
+    const shared = await cache.getLink(key);
+    if (shared) {
+      linkCache.set(key, { url: shared, ts: Date.now() });
+      return { url: shared, key, cached: 'redis' };
+    }
   }
+
   const url = await resolveStream(id, season, episode);
   linkCache.set(key, { url, ts: Date.now() });
+  await cache.setLink(key, url);
   return { url, key, cached: false };
 }
 
 // Re-resolve a fresh playlist URL for a cached stream key (auto-repair).
+// Also invalidates the broken entry from both cache tiers.
 async function repairByKey(key) {
+  linkCache.delete(key);
+  await cache.delLink(key);
   const { id, season, episode } = parseKey(key);
   const { url } = await getStream(id, season, episode, { force: true });
   return url;
@@ -109,6 +126,8 @@ function fetchUpstream(url, redirects = 0) {
   });
 }
 
+// Rewrite every child link (sub-playlists + segments) to flow through our
+// custom /server CDN endpoint, which caches each object in Redis.
 function rewriteM3u8(body, url, key) {
   const base = url.split('?')[0];
   const baseDir = base.substring(0, base.lastIndexOf('/') + 1);
@@ -118,7 +137,7 @@ function rewriteM3u8(body, url, key) {
     const t = line.trim();
     if (!t || t.startsWith('#')) return line;
     const abs = t.startsWith('http') ? t : t.startsWith('/') ? origin + t : baseDir + t;
-    return '/api?url=' + encodeURIComponent(abs) + keyParam;
+    return '/server?url=' + encodeURIComponent(abs) + keyParam;
   }).join('\n');
 }
 
@@ -126,16 +145,55 @@ function rewriteM3u8(body, url, key) {
 module.exports = async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
 
-  const { searchParams } = new URL(req.url, 'http://localhost');
-  const q = Object.fromEntries(searchParams);
+  const parsed = new URL(req.url, 'http://localhost');
+  const q = Object.fromEntries(parsed.searchParams);
+  // /server is our custom CDN endpoint: same proxy logic, but every object
+  // (playlists + segments) is stored in and served from the Redis cache.
+  const isCdn = parsed.pathname.startsWith('/server');
 
-  // Proxy mode: /api?url=...   (optional &k=<streamKey> enables auto-repair)
+  // Proxy / CDN mode: /api?url=...  or  /server?url=...
+  // (optional &k=<streamKey> enables broken-link auto-repair)
   if (q.url) {
     let url = decodeURIComponent(q.url);
     const key = q.k ? decodeURIComponent(q.k) : null;
 
     // Treat the top-level playlist as the "link" worth repairing.
     const isPlaylistUrl = /\.m3u8?(\?|$)/i.test(url.split('?')[0]);
+
+    // ── CDN cache hit: serve straight from our own servers ──────────────────
+    if (isCdn) {
+      const hit = await cache.getBody(url);
+      if (hit) {
+        res.setHeader('Content-Type', hit.ct || 'application/octet-stream');
+        res.setHeader('X-Cache', 'HIT');
+        return res.end(hit.body);
+      }
+    }
+
+    // Buffer + cache a response body, rewriting playlists as needed.
+    const sendBuffered = async (upstream, finalUrl) => {
+      const ct = (upstream.headers['content-type'] || '').toLowerCase();
+      const isM3u8 = ct.includes('mpegurl') || ct.includes('m3u8') ||
+        /\.m3u8?(\?|$)/i.test(finalUrl.split('?')[0]);
+
+      const chunks = [];
+      for await (const chunk of upstream) chunks.push(chunk);
+      let buf = Buffer.concat(chunks);
+      let outCt = ct || 'application/octet-stream';
+
+      if (isM3u8) {
+        buf = Buffer.from(rewriteM3u8(buf.toString('utf8'), finalUrl, key), 'utf8');
+        outCt = 'application/vnd.apple.mpegurl';
+      }
+
+      // Store every fetched link body in the shared CDN cache.
+      if (isCdn) {
+        await cache.setBody(url, outCt, buf);
+        res.setHeader('X-Cache', 'MISS');
+      }
+      res.setHeader('Content-Type', outCt);
+      return res.end(buf);
+    };
 
     try {
       let upstream = await fetchUpstream(url);
@@ -151,12 +209,10 @@ module.exports = async function handler(req, res) {
       const ct = (upstream.headers['content-type'] || '').toLowerCase();
       const isM3u8 = ct.includes('mpegurl') || ct.includes('m3u8') || /\.m3u8?(\?|$)/i.test(url.split('?')[0]);
 
-      if (isM3u8) {
-        const chunks = [];
-        for await (const chunk of upstream) chunks.push(chunk);
-        const body = Buffer.concat(chunks).toString('utf8');
-        res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
-        return res.end(rewriteM3u8(body, url, key));
+      // CDN endpoint always buffers (so it can be cached); plain proxy streams
+      // large non-playlist bodies directly for lower latency.
+      if (isM3u8 || isCdn) {
+        return await sendBuffered(upstream, url);
       } else {
         res.setHeader('Content-Type', ct || 'application/octet-stream');
         if (upstream.headers['content-length']) res.setHeader('Content-Length', upstream.headers['content-length']);
@@ -169,11 +225,7 @@ module.exports = async function handler(req, res) {
         try {
           url = await repairByKey(key);
           const upstream = await fetchUpstream(url);
-          const chunks = [];
-          for await (const chunk of upstream) chunks.push(chunk);
-          const body = Buffer.concat(chunks).toString('utf8');
-          res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
-          return res.end(rewriteM3u8(body, url, key));
+          return await sendBuffered(upstream, url);
         } catch (_) { /* fall through to error */ }
       }
       res.statusCode = 502;
@@ -194,9 +246,9 @@ module.exports = async function handler(req, res) {
     // force=1 lets a client explicitly refresh/repair a cached link.
     const force = q.force === '1' || q.refresh === '1';
     const { url, key, cached } = await getStream(q.id, q.s, q.e, { force });
-    // Route playback through the proxy with the stream key so broken
-    // links are detected and re-resolved automatically.
-    const proxied = '/api?url=' + encodeURIComponent(url) + '&k=' + encodeURIComponent(key);
+    // Route playback through the /server CDN with the stream key so links are
+    // cached on our servers and broken links are re-resolved automatically.
+    const proxied = '/server?url=' + encodeURIComponent(url) + '&k=' + encodeURIComponent(key);
     res.end(JSON.stringify({ url: proxied, direct: url, key, cached }));
   } catch (err) {
     res.statusCode = 500;

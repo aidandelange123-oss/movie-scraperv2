@@ -5,6 +5,7 @@
     "start": "node server.js"
   },
   "dependencies": {
+    "@upstash/redis": "^1.38.0",
     "libsodium-wrappers": "*"
   }
 }

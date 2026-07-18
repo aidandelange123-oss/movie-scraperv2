@@ -2,7 +2,8 @@
   "name": "vidlink-fetcher",
   "version": "1.0.0",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "build": "echo \"No build step required\""
   },
   "dependencies": {
     "@upstash/redis": "^1.38.0",

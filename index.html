@@ -3,176 +3,241 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Stream</title>
-<script src="https://cdn.jsdelivr.net/npm/hls.js@latest/dist/hls.min.js"></script>
+<title>Stream Link API</title>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
-html, body { width: 100%; height: 100%; background: #000; font-family: system-ui, sans-serif; color: #fff; overflow: hidden; }
+:root {
+  --bg: #0b0f17;
+  --panel: #131a26;
+  --border: #223047;
+  --text: #e6edf6;
+  --muted: #8899ad;
+  --accent: #3b82f6;
+  --accent-hover: #60a5fa;
+}
+html, body { min-height: 100%; background: var(--bg); }
+body {
+  font-family: system-ui, -apple-system, sans-serif;
+  color: var(--text);
+  line-height: 1.6;
+  padding: 24px 16px 64px;
+}
+.wrap { max-width: 760px; margin: 0 auto; }
+header { padding: 24px 0 8px; }
+h1 { font-size: 1.9rem; font-weight: 700; letter-spacing: -0.02em; }
+.tag {
+  display: inline-block; font-size: 0.72rem; font-weight: 600; letter-spacing: 0.06em;
+  text-transform: uppercase; color: var(--accent-hover);
+  background: rgba(59,130,246,.12); border: 1px solid rgba(59,130,246,.3);
+  padding: 3px 10px; border-radius: 999px; margin-bottom: 14px;
+}
+p.lead { color: var(--muted); margin-bottom: 8px; }
 
-#loader {
-  position: fixed; inset: 0; display: flex; flex-direction: column;
-  align-items: center; justify-content: center; gap: 28px; background: #000;
+.card {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 14px; padding: 20px; margin-top: 20px;
 }
-#loader-bg {
-  position: absolute; inset: 0;
-  background-size: cover; background-position: center;
-  transition: opacity .6s ease; opacity: 0;
-}
-.spinner {
-  position: relative; z-index: 1;
-  width: 72px; height: 72px;
-  border: 5px solid rgba(255,255,255,.15);
-  border-top-color: #fff; border-radius: 50%;
-  animation: spin .9s linear infinite;
-}
-@keyframes spin { to { transform: rotate(360deg); } }
-#loader-text { position: relative; z-index: 1; font-size: .95rem; color: rgba(255,255,255,.6); letter-spacing: .04em; text-shadow: 0 1px 4px #000; }
+.card h2 { font-size: 0.95rem; font-weight: 600; margin-bottom: 14px; color: var(--text); }
 
-#player { position: fixed; inset: 0; display: none; background: #000; }
-video { width: 100%; height: 100%; display: block; }
+form { display: flex; flex-wrap: wrap; gap: 10px; }
+.field { display: flex; flex-direction: column; gap: 5px; }
+.field.grow { flex: 1 1 160px; }
+label { font-size: 0.72rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+input {
+  background: var(--bg); border: 1px solid var(--border); color: var(--text);
+  border-radius: 9px; padding: 10px 12px; font-size: 0.95rem; width: 100%;
+  font-family: inherit;
+}
+input:focus { outline: none; border-color: var(--accent); }
+input.small { width: 92px; }
+button {
+  background: var(--accent); color: #fff; border: none; border-radius: 9px;
+  padding: 10px 20px; font-size: 0.95rem; font-weight: 600; cursor: pointer;
+  align-self: flex-end; font-family: inherit;
+}
+button:hover { background: var(--accent-hover); }
+button:disabled { opacity: 0.5; cursor: default; }
 
-#usage {
-  position: fixed; inset: 0; display: none; flex-direction: column;
-  align-items: center; justify-content: center; text-align: center;
-  background: #000; gap: 10px;
+.meta { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+.chip {
+  font-size: 0.75rem; color: var(--muted);
+  background: var(--bg); border: 1px solid var(--border);
+  padding: 3px 10px; border-radius: 999px;
 }
-#usage p { font-size: 1.05rem; color: rgba(255,255,255,.65); line-height: 2; }
+.chip b { color: var(--text); font-weight: 600; }
 
-#err {
-  position: fixed; inset: 0; display: none; flex-direction: column;
-  align-items: center; justify-content: center; text-align: center; background: #000;
+.q-row {
+  display: flex; align-items: center; gap: 12px;
+  padding: 12px 0; border-top: 1px solid var(--border);
 }
-#err-title { font-size: 2.4rem; font-weight: 700; color: #fff; margin-bottom: 18px; }
-#err-link { font-size: 1.1rem; color: #60a5fa; text-decoration: underline; cursor: pointer; }
-#err-link:hover { color: #93c5fd; }
-#err-detail {
-  position: absolute; bottom: 28px; left: 50%; transform: translateX(-50%);
-  font-size: .78rem; color: rgba(255,255,255,.35); white-space: nowrap;
-  max-width: 90vw; overflow: hidden; text-overflow: ellipsis;
+.q-label {
+  flex: 0 0 56px; font-weight: 700; font-size: 0.9rem;
+  color: var(--accent-hover);
 }
+.q-url {
+  flex: 1 1 auto; min-width: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.8rem; color: var(--muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.q-url.empty { color: #55627a; font-style: italic; }
+.copy-btn {
+  flex: 0 0 auto; background: transparent; color: var(--accent-hover);
+  border: 1px solid var(--border); padding: 6px 12px; font-size: 0.78rem;
+  border-radius: 7px; align-self: center;
+}
+.copy-btn:hover { background: rgba(59,130,246,.12); }
+
+.status { margin-top: 14px; font-size: 0.9rem; color: var(--muted); min-height: 20px; }
+.status.error { color: #f87171; }
+
+code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.endpoints { color: var(--muted); font-size: 0.88rem; }
+.endpoints div { padding: 4px 0; }
+.endpoints code { color: var(--accent-hover); background: var(--bg); padding: 2px 7px; border-radius: 6px; }
+#result { display: none; }
 </style>
 </head>
 <body>
+<div class="wrap">
+  <header>
+    <div class="tag">HTTP Stream Link API</div>
+    <h1>Stream Link API</h1>
+    <p class="lead">Returns direct HTTP stream URLs in 360p, 480p, 720p and 1080p for any TMDB movie or TV episode.</p>
+  </header>
 
-<div id="loader">
-  <div id="loader-bg"></div>
-  <div class="spinner"></div>
-  <div id="loader-text">Loading stream...</div>
-</div>
+  <div class="card">
+    <h2>Try it</h2>
+    <form id="form">
+      <div class="field grow">
+        <label for="id">TMDB ID</label>
+        <input id="id" inputmode="numeric" placeholder="550" value="550" required>
+      </div>
+      <div class="field">
+        <label for="s">Season</label>
+        <input id="s" class="small" inputmode="numeric" placeholder="—">
+      </div>
+      <div class="field">
+        <label for="e">Episode</label>
+        <input id="e" class="small" inputmode="numeric" placeholder="—">
+      </div>
+      <button type="submit" id="go">Get links</button>
+    </form>
+    <div class="status" id="status"></div>
+  </div>
 
-<div id="usage">
-  <p>
-    <span style="color:#fff;font-size:1.2rem">Stream</span><br><br>
-    <code style="color:rgba(255,255,255,.8)">?id=550</code> &nbsp;— movie<br>
-    <code style="color:rgba(255,255,255,.8)">?id=456&amp;s=1&amp;e=1</code> &nbsp;— TV episode
-  </p>
-</div>
+  <div class="card" id="result">
+    <h2>Stream URLs</h2>
+    <div class="meta" id="meta"></div>
+    <div id="qualities"></div>
+  </div>
 
-<div id="err">
-  <div id="err-title">Error Occurred</div>
-  <a id="err-link" href="#">Try vidsrc.xyz instead?</a>
-  <div id="err-detail"></div>
-</div>
-
-<div id="player">
-  <video id="v" controls autoplay playsinline></video>
+  <div class="card">
+    <h2>Endpoints</h2>
+    <div class="endpoints">
+      <div><code>GET /api?id=550</code> &nbsp;— movie</div>
+      <div><code>GET /api?id=1399&amp;s=1&amp;e=1</code> &nbsp;— TV episode</div>
+      <div><code>GET /api?id=550&amp;force=1</code> &nbsp;— bypass cache &amp; re-resolve</div>
+    </div>
+  </div>
 </div>
 
 <script>
-var TMDB_KEY = '3a73619bbb8fc6d47742d1b5b2b707b5';
+var QUALITIES = ['360p', '480p', '720p', '1080p'];
 
-var MESSAGES = [
-  'Loading stream...', 'Contacting the mothership...', 'Bribing the servers...',
-  'Untangling the cables...', 'Asking nicely...', 'Decoding the matrix...',
-  'Warming up the hamsters...', 'Negotiating with the cloud...', 'Almost there...',
-  'Convincing pixels to move...', 'Poking the API...', 'Summoning bandwidth...',
-  'Greasing the pipes...', 'Waking up the interns...', 'Stealing the stream (legally)...'
-];
-var msgEl = document.getElementById('loader-text');
-var msgIdx = 0;
-var msgTimer = setInterval(function() {
-  msgIdx = (msgIdx + 1) % MESSAGES.length;
-  msgEl.textContent = MESSAGES[msgIdx];
-}, 2200);
+var form = document.getElementById('form');
+var statusEl = document.getElementById('status');
+var resultEl = document.getElementById('result');
+var metaEl = document.getElementById('meta');
+var qualitiesEl = document.getElementById('qualities');
+var goBtn = document.getElementById('go');
 
-var p = new URLSearchParams(location.search);
-var id = p.get('id'), s = p.get('s'), e = p.get('e');
+form.addEventListener('submit', function (ev) {
+  ev.preventDefault();
+  var id = document.getElementById('id').value.trim();
+  var s = document.getElementById('s').value.trim();
+  var e = document.getElementById('e').value.trim();
+  if (!id) return;
 
-function showPlayer() {
-  clearInterval(msgTimer);
-  document.getElementById('loader').style.display = 'none';
-  document.getElementById('player').style.display = 'block';
-}
+  var api = '/api?id=' + encodeURIComponent(id);
+  if (s) api += '&s=' + encodeURIComponent(s) + '&e=' + encodeURIComponent(e || '1');
 
-function showErr(msg) {
-  clearInterval(msgTimer);
-  document.getElementById('loader').style.display = 'none';
-  document.getElementById('err').style.display = 'flex';
-  document.getElementById('err-detail').textContent = msg || '';
-  var vidsrcUrl = s
-    ? 'https://vidsrc.xyz/embed/tv?tmdb=' + id + '&season=' + s + '&episode=' + (e || '1')
-    : 'https://vidsrc.xyz/embed/movie?tmdb=' + id;
-  document.getElementById('err-link').href = vidsrcUrl;
-}
+  goBtn.disabled = true;
+  statusEl.className = 'status';
+  statusEl.textContent = 'Resolving stream links...';
+  resultEl.style.display = 'none';
 
-function loadBackdrop(id, isTv) {
-  var type = isTv ? 'tv' : 'movie';
-  fetch('https://api.themoviedb.org/3/' + type + '/' + id + '?api_key=' + TMDB_KEY)
-    .then(function(r) { return r.json(); })
-    .then(function(d) {
-      var img = d.backdrop_path || d.poster_path;
-      if (!img) return;
-      var url = 'https://wsrv.nl/?url=' + encodeURIComponent('https://image.tmdb.org/t/p/w1280' + img) + '&bg=black&blur=3';
-      var bg = document.getElementById('loader-bg');
-      var preload = new Image();
-      preload.onload = function() { bg.style.backgroundImage = 'url(' + url + ')'; bg.style.opacity = '1'; };
-      preload.src = url;
-    })
-    .catch(function() {});
-}
-
-if (!id) {
-  clearInterval(msgTimer);
-  document.getElementById('loader').style.display = 'none';
-  document.getElementById('usage').style.display = 'flex';
-} else {
-  loadBackdrop(id, !!s);
-  var api = '/api?' + (s ? 'id='+id+'&s='+s+'&e='+(e||'1') : 'id='+id);
   fetch(api)
-    .then(function(r) { return r.json(); })
-    .then(function(d) {
-      if (d.error) return showErr(d.error);
-      play(d.url, d.direct || d.url);
+    .then(function (r) { return r.json(); })
+    .then(function (d) {
+      goBtn.disabled = false;
+      if (d.error) {
+        statusEl.className = 'status error';
+        statusEl.textContent = 'Error: ' + d.error;
+        return;
+      }
+      render(d);
     })
-    .catch(function(err) { showErr(err.message); });
+    .catch(function (err) {
+      goBtn.disabled = false;
+      statusEl.className = 'status error';
+      statusEl.textContent = 'Error: ' + err.message;
+    });
+});
+
+function render(d) {
+  statusEl.textContent = '';
+  metaEl.innerHTML = '';
+  qualitiesEl.innerHTML = '';
+
+  addChip('type', d.type);
+  addChip('id', d.id);
+  if (d.type === 'tv') { addChip('season', d.season); addChip('episode', d.episode); }
+  addChip('cached', d.cached === false ? 'no' : String(d.cached));
+
+  var q = d.qualities || {};
+  QUALITIES.forEach(function (label) {
+    var url = q[label] || '';
+    var row = document.createElement('div');
+    row.className = 'q-row';
+
+    var lab = document.createElement('div');
+    lab.className = 'q-label';
+    lab.textContent = label;
+
+    var urlEl = document.createElement('div');
+    urlEl.className = 'q-url' + (url ? '' : ' empty');
+    urlEl.textContent = url || 'not available';
+
+    row.appendChild(lab);
+    row.appendChild(urlEl);
+
+    if (url) {
+      var btn = document.createElement('button');
+      btn.className = 'copy-btn';
+      btn.type = 'button';
+      btn.textContent = 'Copy';
+      btn.addEventListener('click', function () {
+        navigator.clipboard.writeText(url).then(function () {
+          btn.textContent = 'Copied';
+          setTimeout(function () { btn.textContent = 'Copy'; }, 1400);
+        });
+      });
+      row.appendChild(btn);
+    }
+    qualitiesEl.appendChild(row);
+  });
+
+  resultEl.style.display = 'block';
 }
 
-function play(src, directUrl) {
-  // src is already a proxied /server?url=... link — use it as-is.
-  var v = document.getElementById('v');
-  var isHlsStream = /\.m3u8?(\?|$)/i.test(String(directUrl).split('?')[0]);
-
-  if (isHlsStream && Hls.isSupported()) {
-    var hls = new Hls({ enableWorker: true });
-    hls.loadSource(src);
-    hls.attachMedia(v);
-    hls.on(Hls.Events.MANIFEST_PARSED, function() {
-      showPlayer();
-      v.play().catch(function(){});
-    });
-    hls.on(Hls.Events.ERROR, function(_, d) {
-      if (d.fatal) showErr(d.details || 'HLS fatal error');
-    });
-  } else {
-    // mp4 (or native-HLS browsers like Safari): play directly through the
-    // /server CDN proxy, which supports Range requests for seeking.
-    v.src = src;
-    v.addEventListener('canplay', showPlayer, { once: true });
-    v.addEventListener('error', function() {
-      showErr('Video failed to load' + (v.error ? ' (code ' + v.error.code + ')' : ''));
-    }, { once: true });
-    v.play().catch(function(){});
-  }
+function addChip(k, v) {
+  if (v === undefined || v === null) return;
+  var c = document.createElement('span');
+  c.className = 'chip';
+  c.innerHTML = k + ': <b></b>';
+  c.querySelector('b').textContent = v;
+  metaEl.appendChild(c);
 }
 </script>
 </body>

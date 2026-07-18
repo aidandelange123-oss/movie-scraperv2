@@ -72,26 +72,53 @@ async function resolveStream(id, season, episode) {
   const data = await res.json();
   const stream = data?.stream;
 
-  // Old format: direct HLS playlist.
-  if (stream?.playlist) return stream.playlist;
+  // Standard quality labels we expose in the API.
+  const WANT = ['360', '480', '720', '1080'];
+  const out = { '360p': null, '480p': null, '720p': null, '1080p': null };
 
-  // New format: per-quality mp4 files — pick the highest quality available.
+  // New format: per-quality mp4 files keyed by height (e.g. "360", "720").
   const qualities = stream?.qualities;
   if (qualities && typeof qualities === 'object') {
-    const best = Object.keys(qualities)
-      .map(Number).filter(n => !isNaN(n))
-      .sort((a, b) => b - a)
-      .map(q => qualities[q]?.url)
-      .find(Boolean);
-    if (best) return best;
+    for (const q of WANT) {
+      const item = qualities[q];
+      if (item?.url) out[q + 'p'] = item.url;
+    }
+    // Map any non-standard heights (e.g. 2160/1440) to the nearest label.
+    for (const k of Object.keys(qualities)) {
+      const url = qualities[k]?.url;
+      if (!url || WANT.includes(k)) continue;
+      const n = Number(k);
+      if (!isNaN(n) && n >= 1080 && !out['1080p']) out['1080p'] = url;
+    }
   }
 
-  // Fallbacks: HLS/DASH alternates.
+  // Fallback: expose an HLS/DASH master playlist under every empty slot so
+  // clients always get a usable link even when per-quality mp4s are missing.
   const alt = stream?.alternates;
-  if (alt?.hls?.playlist) return alt.hls.playlist;
-  if (alt?.dash?.playlist) return alt.dash.playlist;
+  const master = stream?.playlist || alt?.hls?.playlist || alt?.dash?.playlist || null;
+  if (master) {
+    for (const label of Object.keys(out)) {
+      if (!out[label]) out[label] = master;
+    }
+  }
 
-  throw new Error('No playable stream in response');
+  if (!Object.values(out).some(Boolean)) {
+    throw new Error('No playable stream in response');
+  }
+  return out;
+}
+
+// Coerce a cached value into a valid qualities object, or null if it is
+// missing / stale / in an old incompatible format (so it gets re-resolved).
+function normalizeQualities(val) {
+  if (!val) return null;
+  let obj = val;
+  if (typeof val === 'string') {
+    try { obj = JSON.parse(val); } catch { return null; }
+  }
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return null;
+  const hasQ = ['360p', '480p', '720p', '1080p'].some(k => obj[k]);
+  return hasQ ? obj : null;
 }
 
 // ── Cached stream resolver ────────────────────────────────────────────────────
@@ -104,29 +131,37 @@ async function getStream(id, season, episode, { force = false } = {}) {
   if (!force) {
     const mem = linkCache.get(key);
     if (mem && Date.now() - mem.ts < CACHE_TTL) {
-      return { url: mem.url, key, cached: 'memory' };
+      return { qualities: mem.qualities, key, cached: 'memory' };
     }
     const shared = await cache.getLink(key);
-    if (shared) {
-      linkCache.set(key, { url: shared, ts: Date.now() });
-      return { url: shared, key, cached: 'redis' };
+    const qualities = normalizeQualities(shared);
+    if (qualities) {
+      linkCache.set(key, { qualities, ts: Date.now() });
+      return { qualities, key, cached: 'redis' };
     }
   }
 
-  const url = await resolveStream(id, season, episode);
-  linkCache.set(key, { url, ts: Date.now() });
-  await cache.setLink(key, url);
-  return { url, key, cached: false };
+  const qualities = await resolveStream(id, season, episode);
+  linkCache.set(key, { qualities, ts: Date.now() });
+  await cache.setLink(key, JSON.stringify(qualities));
+  return { qualities, key, cached: false };
 }
 
-// Re-resolve a fresh playlist URL for a cached stream key (auto-repair).
+// Re-resolve fresh quality links for a cached stream key (auto-repair).
 // Also invalidates the broken entry from both cache tiers.
 async function repairByKey(key) {
   linkCache.delete(key);
   await cache.delLink(key);
   const { id, season, episode } = parseKey(key);
-  const { url } = await getStream(id, season, episode, { force: true });
-  return url;
+  const { qualities } = await getStream(id, season, episode, { force: true });
+  return qualities;
+}
+
+// Best available direct link from a qualities object (highest quality first).
+function bestQuality(qualities) {
+  const order = ['1080p', '720p', '480p', '360p'];
+  for (const q of order) if (qualities?.[q]) return qualities[q];
+  return null;
 }
 
 // ── Upstream fetcher with redirect + Range support ────────────────────────────
@@ -234,10 +269,11 @@ module.exports = async function handler(req, res) {
     try {
       let upstream = await fetchUpstream(url, range);
 
-      // Broken link → re-resolve a fresh one and retry once.
+      // Broken link → re-resolve fresh quality links and retry once.
       if (upstream.statusCode >= 400 && repairable) {
         try {
-          url = await repairByKey(key);
+          const fresh = await repairByKey(key);
+          url = bestQuality(fresh) || url;
           upstream = await fetchUpstream(url, range);
         } catch (_) { /* fall through with original response */ }
       }
@@ -256,7 +292,8 @@ module.exports = async function handler(req, res) {
       // Connection-level failure → attempt repair before giving up.
       if (repairable) {
         try {
-          url = await repairByKey(key);
+          const fresh = await repairByKey(key);
+          url = bestQuality(fresh) || url;
           const upstream = await fetchUpstream(url, range);
           const ct = (upstream.headers['content-type'] || '').toLowerCase();
           const isM3u8 = ct.includes('mpegurl') || ct.includes('m3u8') || /\.m3u8?(\?|$)/i.test(url.split('?')[0]);
@@ -279,13 +316,20 @@ module.exports = async function handler(req, res) {
 
   res.setHeader('Content-Type', 'application/json');
   try {
-    // force=1 lets a client explicitly refresh/repair a cached link.
+    // force=1 lets a client explicitly refresh/repair cached links.
     const force = q.force === '1' || q.refresh === '1';
-    const { url, key, cached } = await getStream(q.id, q.s, q.e, { force });
-    // Route playback through the /server CDN with the stream key so links are
-    // cached on our servers and broken links are re-resolved automatically.
-    const proxied = '/server?url=' + encodeURIComponent(url) + '&k=' + encodeURIComponent(key);
-    res.end(JSON.stringify({ url: proxied, direct: url, key, cached }));
+    const { qualities, key, cached } = await getStream(q.id, q.s, q.e, { force });
+
+    // Pure link API: return the direct HTTP stream URL for each quality.
+    res.end(JSON.stringify({
+      id: q.id,
+      type: q.s ? 'tv' : 'movie',
+      season: q.s ? Number(q.s) : undefined,
+      episode: q.s ? Number(q.e || 1) : undefined,
+      cached,
+      key,
+      qualities,
+    }, null, 2));
   } catch (err) {
     res.statusCode = 500;
     res.end(JSON.stringify({ error: err.message }));

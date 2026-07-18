@@ -70,9 +70,28 @@ async function resolveStream(id, season, episode) {
   });
   if (!res.ok) throw new Error(`vidlink API returned ${res.status}`);
   const data = await res.json();
-  const playlist = data?.stream?.playlist;
-  if (!playlist) throw new Error('No playlist in response');
-  return playlist;
+  const stream = data?.stream;
+
+  // Old format: direct HLS playlist.
+  if (stream?.playlist) return stream.playlist;
+
+  // New format: per-quality mp4 files — pick the highest quality available.
+  const qualities = stream?.qualities;
+  if (qualities && typeof qualities === 'object') {
+    const best = Object.keys(qualities)
+      .map(Number).filter(n => !isNaN(n))
+      .sort((a, b) => b - a)
+      .map(q => qualities[q]?.url)
+      .find(Boolean);
+    if (best) return best;
+  }
+
+  // Fallbacks: HLS/DASH alternates.
+  const alt = stream?.alternates;
+  if (alt?.hls?.playlist) return alt.hls.playlist;
+  if (alt?.dash?.playlist) return alt.dash.playlist;
+
+  throw new Error('No playable stream in response');
 }
 
 // ── Cached stream resolver ────────────────────────────────────────────────────
@@ -110,16 +129,16 @@ async function repairByKey(key) {
   return url;
 }
 
-// ── HLS upstream fetcher with redirect support ────────────────────────────────
-function fetchUpstream(url, redirects = 0) {
+// ── Upstream fetcher with redirect + Range support ────────────────────────────
+function fetchUpstream(url, range = null, redirects = 0) {
   return new Promise((resolve, reject) => {
     if (redirects > 5) return reject(new Error('too many redirects'));
-    (url.startsWith('https') ? https : http).get(url, {
-      headers: { Referer: REFERER, Origin: ORIGIN, 'User-Agent': UA, Accept: '*/*' }
-    }, res => {
+    const headers = { Referer: REFERER, Origin: ORIGIN, 'User-Agent': UA, Accept: '*/*' };
+    if (range) headers.Range = range;
+    (url.startsWith('https') ? https : http).get(url, { headers }, res => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         const loc = res.headers.location;
-        return resolve(fetchUpstream(loc.startsWith('http') ? loc : new URL(loc, url).href, redirects + 1));
+        return resolve(fetchUpstream(loc.startsWith('http') ? loc : new URL(loc, url).href, range, redirects + 1));
       }
       resolve(res);
     }).on('error', reject);
@@ -154,14 +173,20 @@ module.exports = async function handler(req, res) {
   // Proxy / CDN mode: /api?url=...  or  /server?url=...
   // (optional &k=<streamKey> enables broken-link auto-repair)
   if (q.url) {
-    let url = decodeURIComponent(q.url);
-    const key = q.k ? decodeURIComponent(q.k) : null;
+    // searchParams already URL-decodes values — do not decode again, or
+    // percent-encoded params inside signed upstream URLs get corrupted.
+    let url = q.url;
+    const key = q.k || null;
+    const range = req.headers.range || null;
 
-    // Treat the top-level playlist as the "link" worth repairing.
-    const isPlaylistUrl = /\.m3u8?(\?|$)/i.test(url.split('?')[0]);
+    // The main media link (playlist or mp4 file) is the one worth repairing.
+    const isPlaylistUrl = /\.(m3u8?|mpd)(\?|$)/i.test(url.split('?')[0]);
+    const isMediaFileUrl = /\.(mp4|mkv|webm)(\?|$)/i.test(url.split('?')[0]);
+    const repairable = key && (isPlaylistUrl || isMediaFileUrl);
 
-    // ── CDN cache hit: serve straight from our own servers ──────────────────
-    if (isCdn) {
+    // ── CDN cache hit: serve straight from our own servers (playlists only —
+    // large media files are streamed with Range support, not buffered) ───────
+    if (isCdn && !range) {
       const hit = await cache.getBody(url);
       if (hit) {
         res.setHeader('Content-Type', hit.ct || 'application/octet-stream');
@@ -195,37 +220,48 @@ module.exports = async function handler(req, res) {
       return res.end(buf);
     };
 
-    try {
-      let upstream = await fetchUpstream(url);
+    // Stream a (possibly large) media response through, preserving Range
+    // semantics so video seeking works.
+    const sendStreamed = (upstream, ct) => {
+      res.statusCode = upstream.statusCode;
+      res.setHeader('Content-Type', ct || 'application/octet-stream');
+      for (const h of ['content-length', 'content-range', 'accept-ranges']) {
+        if (upstream.headers[h]) res.setHeader(h, upstream.headers[h]);
+      }
+      upstream.pipe(res);
+    };
 
-      // Broken link → re-resolve a fresh playlist and retry once.
-      if (upstream.statusCode >= 400 && key && isPlaylistUrl) {
+    try {
+      let upstream = await fetchUpstream(url, range);
+
+      // Broken link → re-resolve a fresh one and retry once.
+      if (upstream.statusCode >= 400 && repairable) {
         try {
           url = await repairByKey(key);
-          upstream = await fetchUpstream(url);
+          upstream = await fetchUpstream(url, range);
         } catch (_) { /* fall through with original response */ }
       }
 
       const ct = (upstream.headers['content-type'] || '').toLowerCase();
       const isM3u8 = ct.includes('mpegurl') || ct.includes('m3u8') || /\.m3u8?(\?|$)/i.test(url.split('?')[0]);
 
-      // CDN endpoint always buffers (so it can be cached); plain proxy streams
-      // large non-playlist bodies directly for lower latency.
-      if (isM3u8 || isCdn) {
+      // Playlists are buffered (rewritten + cached in the CDN); everything
+      // else (mp4/segments) streams straight through with Range support.
+      if (isM3u8) {
         return await sendBuffered(upstream, url);
       } else {
-        res.setHeader('Content-Type', ct || 'application/octet-stream');
-        if (upstream.headers['content-length']) res.setHeader('Content-Length', upstream.headers['content-length']);
-        res.statusCode = upstream.statusCode;
-        upstream.pipe(res);
+        sendStreamed(upstream, ct);
       }
     } catch (err) {
       // Connection-level failure → attempt repair before giving up.
-      if (key && isPlaylistUrl) {
+      if (repairable) {
         try {
           url = await repairByKey(key);
-          const upstream = await fetchUpstream(url);
-          return await sendBuffered(upstream, url);
+          const upstream = await fetchUpstream(url, range);
+          const ct = (upstream.headers['content-type'] || '').toLowerCase();
+          const isM3u8 = ct.includes('mpegurl') || ct.includes('m3u8') || /\.m3u8?(\?|$)/i.test(url.split('?')[0]);
+          if (isM3u8) return await sendBuffered(upstream, url);
+          return sendStreamed(upstream, ct);
         } catch (_) { /* fall through to error */ }
       }
       res.statusCode = 502;

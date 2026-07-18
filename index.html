@@ -142,15 +142,17 @@ if (!id) {
     .then(function(r) { return r.json(); })
     .then(function(d) {
       if (d.error) return showErr(d.error);
-      play(d.url);
+      play(d.url, d.direct || d.url);
     })
     .catch(function(err) { showErr(err.message); });
 }
 
-function play(rawUrl) {
-  var src = '/api?url=' + encodeURIComponent(rawUrl);
+function play(src, directUrl) {
+  // src is already a proxied /server?url=... link — use it as-is.
   var v = document.getElementById('v');
-  if (Hls.isSupported()) {
+  var isHlsStream = /\.m3u8?(\?|$)/i.test(String(directUrl).split('?')[0]);
+
+  if (isHlsStream && Hls.isSupported()) {
     var hls = new Hls({ enableWorker: true });
     hls.loadSource(src);
     hls.attachMedia(v);
@@ -162,9 +164,14 @@ function play(rawUrl) {
       if (d.fatal) showErr(d.details || 'HLS fatal error');
     });
   } else {
+    // mp4 (or native-HLS browsers like Safari): play directly through the
+    // /server CDN proxy, which supports Range requests for seeking.
     v.src = src;
     v.addEventListener('canplay', showPlayer, { once: true });
-    v.play().catch(function(err) { showErr(err.message); });
+    v.addEventListener('error', function() {
+      showErr('Video failed to load' + (v.error ? ' (code ' + v.error.code + ')' : ''));
+    }, { once: true });
+    v.play().catch(function(){});
   }
 }
 </script>

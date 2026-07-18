@@ -31,6 +31,29 @@ html, body { width: 100%; height: 100%; background: #000; font-family: system-ui
 #player { position: fixed; inset: 0; display: none; background: #000; }
 video { width: 100%; height: 100%; display: block; }
 
+#src-bar {
+  position: fixed; top: 14px; right: 14px; z-index: 10;
+  display: none; gap: 6px; align-items: center;
+  background: rgba(0,0,0,.55); backdrop-filter: blur(8px);
+  padding: 6px; border-radius: 10px; border: 1px solid rgba(255,255,255,.12);
+}
+#src-bar button {
+  background: transparent; color: rgba(255,255,255,.7);
+  border: 1px solid transparent; border-radius: 7px;
+  padding: 6px 12px; font-size: .82rem; cursor: pointer;
+  font-family: inherit; transition: all .15s ease;
+}
+#src-bar button:hover { color: #fff; background: rgba(255,255,255,.08); }
+#src-bar button.active {
+  background: rgba(255,255,255,.14); color: #fff;
+  border-color: rgba(255,255,255,.2);
+}
+
+#iframe-wrap {
+  position: fixed; inset: 0; display: none; background: #000;
+}
+#iframe-wrap iframe { width: 100%; height: 100%; border: 0; }
+
 #usage {
   position: fixed; inset: 0; display: none; flex-direction: column;
   align-items: center; justify-content: center; text-align: center;
@@ -78,6 +101,15 @@ video { width: 100%; height: 100%; display: block; }
   <video id="v" controls autoplay playsinline></video>
 </div>
 
+<div id="src-bar">
+  <button data-src="vidlink" class="active">Vidlink</button>
+  <button data-src="vidsrc">vidsrc.to</button>
+</div>
+
+<div id="iframe-wrap">
+  <iframe id="vframe" allowfullscreen allow="autoplay; encrypted-media; fullscreen"></iframe>
+</div>
+
 <script>
 var TMDB_KEY = '3a73619bbb8fc6d47742d1b5b2b707b5';
 
@@ -97,11 +129,21 @@ var msgTimer = setInterval(function() {
 
 var p = new URLSearchParams(location.search);
 var id = p.get('id'), s = p.get('s'), e = p.get('e');
+var imdbId = null;       // fetched from TMDB, used by vidsrc.to
+var currentSrc = 'vidlink';
+var vidlinkResult = null; // cached /api response so switching back is instant
 
 function showPlayer() {
   clearInterval(msgTimer);
   document.getElementById('loader').style.display = 'none';
-  document.getElementById('player').style.display = 'block';
+  document.getElementById('src-bar').style.display = 'flex';
+  if (currentSrc === 'vidsrc') {
+    document.getElementById('player').style.display = 'none';
+    document.getElementById('iframe-wrap').style.display = 'block';
+  } else {
+    document.getElementById('iframe-wrap').style.display = 'none';
+    document.getElementById('player').style.display = 'block';
+  }
 }
 
 function showErr(msg) {
@@ -115,11 +157,45 @@ function showErr(msg) {
   document.getElementById('err-link').href = vidsrcUrl;
 }
 
+function vidsrcToUrl() {
+  // vidsrc.to prefers IMDb IDs but falls back to TMDB via the same endpoint.
+  var key = imdbId || id;
+  if (s) {
+    return 'https://vidsrc.to/embed/tv/' + key + '/' + s + '/' + (e || '1');
+  }
+  return 'https://vidsrc.to/embed/movie/' + key;
+}
+
+function playVidsrc() {
+  currentSrc = 'vidsrc';
+  var f = document.getElementById('vframe');
+  f.src = vidsrcToUrl();
+  showPlayer();
+}
+
+function playVidlink() {
+  currentSrc = 'vidlink';
+  var v = document.getElementById('v');
+  // Reset any previous source so canplay fires again on switch-back.
+  v.removeAttribute('src'); v.load();
+  if (!vidlinkResult) { showErr('Vidlink source unavailable'); return; }
+  play(vidlinkResult.url, vidlinkResult.direct || vidlinkResult.url);
+}
+
+document.getElementById('src-bar').addEventListener('click', function(ev) {
+  var btn = ev.target.closest('button[data-src]'); if (!btn) return;
+  if (btn.dataset.src === currentSrc) return;
+  document.querySelectorAll('#src-bar button').forEach(function(b) { b.classList.remove('active'); });
+  btn.classList.add('active');
+  if (btn.dataset.src === 'vidsrc') playVidsrc(); else playVidlink();
+});
+
 function loadBackdrop(id, isTv) {
   var type = isTv ? 'tv' : 'movie';
-  fetch('https://api.themoviedb.org/3/' + type + '/' + id + '?api_key=' + TMDB_KEY)
+  fetch('https://api.themoviedb.org/3/' + type + '/' + id + '?api_key=' + TMDB_KEY + '&append_to_response=external_ids')
     .then(function(r) { return r.json(); })
     .then(function(d) {
+      if (d.external_ids && d.external_ids.imdb_id) imdbId = d.external_ids.imdb_id;
       var img = d.backdrop_path || d.poster_path;
       if (!img) return;
       var url = 'https://wsrv.nl/?url=' + encodeURIComponent('https://image.tmdb.org/t/p/w1280' + img) + '&bg=black&blur=3';
@@ -136,15 +212,41 @@ if (!id) {
   document.getElementById('loader').style.display = 'none';
   document.getElementById('usage').style.display = 'flex';
 } else {
+  // ?src=vidsrc bootstraps directly into the iframe source.
+  var bootSrc = p.get('src') === 'vidsrc' ? 'vidsrc' : 'vidlink';
   loadBackdrop(id, !!s);
-  var api = '/api?' + (s ? 'id='+id+'&s='+s+'&e='+(e||'1') : 'id='+id);
-  fetch(api)
-    .then(function(r) { return r.json(); })
-    .then(function(d) {
-      if (d.error) return showErr(d.error);
-      play(d.url, d.direct || d.url);
-    })
-    .catch(function(err) { showErr(err.message); });
+
+  if (bootSrc === 'vidsrc') {
+    // Mark the bar active for vidsrc, then play it (imdbId may still be
+    // loading in the background — vidsrc.to falls back to TMDB id).
+    document.querySelectorAll('#src-bar button').forEach(function(b) {
+      b.classList.toggle('active', b.dataset.src === 'vidsrc');
+    });
+    playVidsrc();
+  } else {
+    var api = '/api?' + (s ? 'id='+id+'&s='+s+'&e='+(e||'1') : 'id='+id);
+    fetch(api)
+      .then(function(r) { return r.json(); })
+      .then(function(d) {
+        if (d.error) {
+          // Vidlink failed — auto-fallback to vidsrc.to instead of the error screen.
+          vidlinkResult = null;
+          document.querySelectorAll('#src-bar button').forEach(function(b) {
+            b.classList.toggle('active', b.dataset.src === 'vidsrc');
+          });
+          return playVidsrc();
+        }
+        vidlinkResult = d;
+        play(d.url, d.direct || d.url);
+      })
+      .catch(function() {
+        // Network/API failure — also fall back to vidsrc.to.
+        document.querySelectorAll('#src-bar button').forEach(function(b) {
+          b.classList.toggle('active', b.dataset.src === 'vidsrc');
+        });
+        playVidsrc();
+      });
+  }
 }
 
 function play(src, directUrl) {
